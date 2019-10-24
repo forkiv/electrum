@@ -32,10 +32,13 @@ from PyQt5.QtWidgets import QVBoxLayout, QLineEdit, QHBoxLayout, QLabel
 
 from electrum.gui.qt.password_dialog import PasswordLayout, PW_PASSPHRASE
 from electrum.gui.qt.util import (read_QIcon, WWLabel, OkButton, WindowModalDialog,
-                                  Buttons, CancelButton, TaskThread)
+                                  Buttons, CancelButton, TaskThread, char_width_in_lineedit)
 
 from electrum.i18n import _
 from electrum.logging import Logger
+from electrum.util import parse_URI, InvalidBitcoinURI
+
+from .plugin import OutdatedHwFirmwareException
 
 
 # The trickiest thing about this handler was getting windows properly
@@ -147,7 +150,7 @@ class QtHandlerBase(QObject, Logger):
         hbox = QHBoxLayout(dialog)
         hbox.addWidget(QLabel(msg))
         text = QLineEdit()
-        text.setMaximumWidth(100)
+        text.setMaximumWidth(12 * char_width_in_lineedit())
         text.returnPressed.connect(dialog.accept)
         hbox.addWidget(text)
         hbox.addStretch(1)
@@ -212,10 +215,26 @@ class QtPluginBase(object):
             handler = self.create_handler(window)
             handler.button = button
             keystore.handler = handler
-            keystore.thread = TaskThread(window, window.on_error)
+            keystore.thread = TaskThread(window, on_error=partial(self.on_task_thread_error, window, keystore))
             self.add_show_address_on_hw_device_button_for_receive_addr(wallet, keystore, window)
             # Trigger a pairing
             keystore.thread.add(partial(self.get_client, keystore))
+
+    def on_task_thread_error(self, window, keystore, exc_info):
+        e = exc_info[1]
+        if isinstance(e, OutdatedHwFirmwareException):
+            if window.question(e.text_ignore_old_fw_and_continue(), title=_("Outdated device firmware")):
+                self.set_ignore_outdated_fw()
+                # will need to re-pair
+                devmgr = self.device_manager()
+                def re_pair_device():
+                    device_id = self.choose_device(window, keystore)
+                    devmgr.unpair_id(device_id)
+                    self.get_client(keystore)
+                keystore.thread.add(re_pair_device)
+            return
+        else:
+            window.on_error(exc_info)
 
     def choose_device(self, window, keystore):
         '''This dialog box should be usable even if the user has
@@ -237,6 +256,14 @@ class QtPluginBase(object):
         receive_address_e = main_window.receive_address_e
 
         def show_address():
-            addr = receive_address_e.text()
+            addr = str(receive_address_e.text())
+            # note: 'addr' could be ln invoice or BIP21 URI
+            try:
+                uri = parse_URI(addr)
+            except InvalidBitcoinURI:
+                pass
+            else:
+                addr = uri.get('address')
             keystore.thread.add(partial(plugin.show_address, wallet, addr, keystore))
-        receive_address_e.addButton("eye1.png", show_address, _("Show on {}").format(plugin.device))
+        dev_name = f"{plugin.device} ({keystore.label})"
+        receive_address_e.addButton("eye1.png", show_address, _("Show on {}").format(dev_name))

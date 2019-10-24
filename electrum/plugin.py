@@ -27,10 +27,11 @@ import pkgutil
 import importlib.util
 import time
 import threading
+import sys
 from typing import NamedTuple, Any, Union, TYPE_CHECKING, Optional
 
 from .i18n import _
-from .util import (profiler, DaemonThread, UserCancelled, ThreadJob)
+from .util import (profiler, DaemonThread, UserCancelled, ThreadJob, UserFacingException)
 from . import bip32
 from . import plugins
 from .simple_config import SimpleConfig
@@ -73,6 +74,9 @@ class Plugins(DaemonThread):
                 raise Exception(f"Error pre-loading {full_name}: no spec")
             try:
                 module = importlib.util.module_from_spec(spec)
+                # sys.modules needs to be modified for relative imports to work
+                # see https://stackoverflow.com/a/50395128
+                sys.modules[spec.name] = module
                 spec.loader.exec_module(module)
             except Exception as e:
                 raise Exception(f"Error pre-loading {full_name}: {repr(e)}") from e
@@ -281,8 +285,8 @@ class BasePlugin(Logger):
         pass
 
 
-class DeviceNotFoundError(Exception): pass
-class DeviceUnpairableError(Exception): pass
+class DeviceUnpairableError(UserFacingException): pass
+class HardwarePluginLibraryUnavailable(Exception): pass
 
 
 class Device(NamedTuple):
@@ -402,7 +406,7 @@ class DeviceMgr(ThreadJob):
 
     def unpair_xpub(self, xpub):
         with self.lock:
-            if not xpub in self.xpub_ids:
+            if xpub not in self.xpub_ids:
                 return
             _id = self.xpub_ids.pop(xpub)
             self._close_client(_id)
@@ -502,7 +506,7 @@ class DeviceMgr(ThreadJob):
         unpaired device accepted by the plugin.'''
         if not plugin.libraries_available:
             message = plugin.get_library_not_available_message()
-            raise Exception(message)
+            raise HardwarePluginLibraryUnavailable(message)
         if devices is None:
             devices = self.scan_devices()
         devices = [dev for dev in devices if not self.xpub_by_id(dev.id_)]
@@ -601,7 +605,7 @@ class DeviceMgr(ThreadJob):
                 new_devices = f()
             except BaseException as e:
                 self.logger.error('custom device enum failed. func {}, error {}'
-                                  .format(str(f), str(e)))
+                                  .format(str(f), repr(e)))
             else:
                 devices.extend(new_devices)
 

@@ -23,7 +23,7 @@
 import binascii
 import os, sys, re, json
 from collections import defaultdict, OrderedDict
-from typing import NamedTuple, Union, TYPE_CHECKING, Tuple, Optional, Callable, Any
+from typing import NamedTuple, Union, TYPE_CHECKING, Tuple, Optional, Callable, Any, Sequence
 from datetime import datetime
 import decimal
 from decimal import Decimal
@@ -40,11 +40,13 @@ import json
 import time
 from typing import NamedTuple, Optional
 import ssl
+import ipaddress
 
 import aiohttp
 from aiohttp_socks import SocksConnector, SocksVer
 from aiorpcx import TaskGroup
 import certifi
+import dns.resolver
 
 from .i18n import _
 from .logging import get_logger, Logger
@@ -70,6 +72,56 @@ base_units_inverse = inv_dict(base_units)
 base_units_list = ['BTC', 'mBTC', 'bits', 'sat']  # list(dict) does not guarantee order
 
 DECIMAL_POINT_DEFAULT = 5  # mBTC
+
+# types of payment requests
+PR_TYPE_ONCHAIN = 0
+PR_TYPE_LN = 2
+
+# status of payment requests
+PR_UNPAID   = 0
+PR_EXPIRED  = 1
+PR_UNKNOWN  = 2     # sent but not propagated
+PR_PAID     = 3     # send and propagated
+PR_INFLIGHT = 4     # unconfirmed
+PR_FAILED   = 5
+
+pr_color = {
+    PR_UNPAID:   (.7, .7, .7, 1),
+    PR_PAID:     (.2, .9, .2, 1),
+    PR_UNKNOWN:  (.7, .7, .7, 1),
+    PR_EXPIRED:  (.9, .2, .2, 1),
+    PR_INFLIGHT: (.9, .6, .3, 1),
+    PR_FAILED:   (.9, .2, .2, 1),
+}
+
+pr_tooltips = {
+    PR_UNPAID:_('Pending'),
+    PR_PAID:_('Paid'),
+    PR_UNKNOWN:_('Unknown'),
+    PR_EXPIRED:_('Expired'),
+    PR_INFLIGHT:_('In progress'),
+    PR_FAILED:_('Failed'),
+}
+
+pr_expiration_values = {
+    10*60: _('10 minutes'),
+    60*60: _('1 hour'),
+    24*60*60: _('1 day'),
+    7*24*60*60: _('1 week')
+}
+
+def get_request_status(req):
+    status = req['status']
+    if req['status'] == PR_UNPAID and 'exp' in req and req['time'] + req['exp'] < time.time():
+        status = PR_EXPIRED
+    status_str = pr_tooltips[status]
+    if status == PR_UNPAID:
+        if req.get('exp'):
+            expiration = req['exp'] + req['time']
+            status_str = _('Expires') + ' ' + age(expiration, include_seconds=True)
+        else:
+            status_str = _('Pending')
+    return status, status_str
 
 
 class UnknownBaseUnit(Exception): pass
@@ -131,6 +183,7 @@ class BitcoinException(Exception): pass
 class UserFacingException(Exception):
     """Exception that contains information intended to be shown to the user."""
 
+class InvoiceError(Exception): pass
 
 # Throw this exception to unwind the stack like when an error occurs.
 # However unlike other exceptions the user won't be informed.
@@ -216,7 +269,9 @@ class MyEncoder(json.JSONEncoder):
             return obj.isoformat(' ')[:-3]
         if isinstance(obj, set):
             return list(obj)
-        return super().default(obj)
+        if hasattr(obj, 'to_json') and callable(obj.to_json):
+            return obj.to_json()
+        return super(MyEncoder, self).default(obj)
 
 
 class ThreadJob(Logger):
@@ -468,6 +523,12 @@ def bh2u(x: bytes) -> str:
     return x.hex()
 
 
+def xor_bytes(a: bytes, b: bytes) -> bytes:
+    size = min(len(a), len(b))
+    return ((int.from_bytes(a[:size], "big") ^ int.from_bytes(b[:size], "big"))
+            .to_bytes(size, "big"))
+
+
 def user_dir():
     if 'ANDROID_DATA' in os.environ:
         return android_data_dir()
@@ -520,6 +581,14 @@ def is_non_negative_integer(val) -> bool:
     return False
 
 
+def chunks(items, size: int):
+    """Break up items, an iterable, into chunks of length size."""
+    if size < 1:
+        raise ValueError(f"size must be positive, not {repr(size)}")
+    for i in range(0, len(items), size):
+        yield items[i: i + size]
+
+
 def format_satoshis_plain(x, decimal_point = 8):
     """Display a satoshi amount scaled.  Always uses a '.' as a decimal
     point and has no thousands separator"""
@@ -527,12 +596,14 @@ def format_satoshis_plain(x, decimal_point = 8):
     return "{:.8f}".format(Decimal(x) / scale_factor).rstrip('0').rstrip('.')
 
 
-DECIMAL_POINT = localeconv()['decimal_point']
+DECIMAL_POINT = localeconv()['decimal_point']  # type: str
 
 
-def format_satoshis(x, num_zeros=0, decimal_point=8, precision=None, is_diff=False, whitespaces=False):
+def format_satoshis(x, num_zeros=0, decimal_point=8, precision=None, is_diff=False, whitespaces=False) -> str:
     if x is None:
         return 'unknown'
+    if x == '!':
+        return 'max'
     if precision is None:
         precision = decimal_point
     # format string
@@ -604,22 +675,11 @@ def time_difference(distance_in_time, include_seconds):
     distance_in_seconds = int(round(abs(distance_in_time.days * 86400 + distance_in_time.seconds)))
     distance_in_minutes = int(round(distance_in_seconds/60))
 
-    if distance_in_minutes <= 1:
+    if distance_in_minutes == 0:
         if include_seconds:
-            for remainder in [5, 10, 20]:
-                if distance_in_seconds < remainder:
-                    return "less than %s seconds" % remainder
-            if distance_in_seconds < 40:
-                return "half a minute"
-            elif distance_in_seconds < 60:
-                return "less than a minute"
-            else:
-                return "1 minute"
+            return "%s seconds" % distance_in_seconds
         else:
-            if distance_in_minutes == 0:
-                return "less than a minute"
-            else:
-                return "1 minute"
+            return "less than a minute"
     elif distance_in_minutes < 45:
         return "%s minutes" % distance_in_minutes
     elif distance_in_minutes < 90:
@@ -644,7 +704,7 @@ mainnet_block_explorers = {
                         {'tx': 'transactions/', 'addr': 'addresses/'}),
     'Bitflyer.jp': ('https://chainflyer.bitflyer.jp/',
                         {'tx': 'Transaction/', 'addr': 'Address/'}),
-    'Blockchain.info': ('https://blockchain.info/',
+    'Blockchain.info': ('https://blockchain.com/btc/',
                         {'tx': 'tx/', 'addr': 'address/'}),
     'blockchainbdgpzk.onion': ('https://blockchainbdgpzk.onion/',
                         {'tx': 'tx/', 'addr': 'address/'}),
@@ -652,8 +712,8 @@ mainnet_block_explorers = {
                         {'tx': 'tx/', 'addr': 'address/'}),
     'Bitaps.com': ('https://btc.bitaps.com/',
                         {'tx': '', 'addr': ''}),
-    'BTC.com': ('https://chain.btc.com/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
+    'BTC.com': ('https://btc.com/',
+                        {'tx': '', 'addr': ''}),
     'Chain.so': ('https://www.chain.so/',
                         {'tx': 'tx/BTC/', 'addr': 'address/BTC/'}),
     'Insight.is': ('https://insight.bitpay.com/',
@@ -679,12 +739,10 @@ testnet_block_explorers = {
                        {'tx': '', 'addr': ''}),
     'BlockCypher.com': ('https://live.blockcypher.com/btc-testnet/',
                        {'tx': 'tx/', 'addr': 'address/'}),
-    'Blockchain.info': ('https://testnet.blockchain.info/',
+    'Blockchain.info': ('https://www.blockchain.com/btctest/',
                        {'tx': 'tx/', 'addr': 'address/'}),
     'Blockstream.info': ('https://blockstream.info/testnet/',
                         {'tx': 'tx/', 'addr': 'address/'}),
-    'BTC.com': ('https://tchain.btc.com/',
-                       {'tx': '', 'addr': ''}),
     'smartbit.com.au': ('https://testnet.smartbit.com.au/',
                        {'tx': 'tx/', 'addr': 'address/'}),
     'system default': ('blockchain://000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943/',
@@ -720,18 +778,25 @@ def block_explorer_URL(config: 'SimpleConfig', kind: str, item: str) -> Optional
 #_ud = re.compile('%([0-9a-hA-H]{2})', re.MULTILINE)
 #urldecode = lambda x: _ud.sub(lambda m: chr(int(m.group(1), 16)), x)
 
-def parse_URI(uri: str, on_pr: Callable=None) -> dict:
+class InvalidBitcoinURI(Exception): pass
+
+
+def parse_URI(uri: str, on_pr: Callable = None, *, loop=None) -> dict:
+    """Raises InvalidBitcoinURI on malformed URI."""
     from . import bitcoin
     from .bitcoin import COIN
 
+    if not isinstance(uri, str):
+        raise InvalidBitcoinURI(f"expected string, not {repr(uri)}")
+
     if ':' not in uri:
         if not bitcoin.is_address(uri):
-            raise Exception("Not a bitcoin address")
+            raise InvalidBitcoinURI("Not a bitcoin address")
         return {'address': uri}
 
     u = urllib.parse.urlparse(uri)
     if u.scheme != 'bitcoin':
-        raise Exception("Not a bitcoin URI")
+        raise InvalidBitcoinURI("Not a bitcoin URI")
     address = u.path
 
     # python for android fails to parse query
@@ -742,37 +807,50 @@ def parse_URI(uri: str, on_pr: Callable=None) -> dict:
         pq = urllib.parse.parse_qs(u.query)
 
     for k, v in pq.items():
-        if len(v)!=1:
-            raise Exception('Duplicate Key', k)
+        if len(v) != 1:
+            raise InvalidBitcoinURI(f'Duplicate Key: {repr(k)}')
 
     out = {k: v[0] for k, v in pq.items()}
     if address:
         if not bitcoin.is_address(address):
-            raise Exception("Invalid bitcoin address:" + address)
+            raise InvalidBitcoinURI(f"Invalid bitcoin address: {address}")
         out['address'] = address
     if 'amount' in out:
         am = out['amount']
-        m = re.match(r'([0-9.]+)X([0-9])', am)
-        if m:
-            k = int(m.group(2)) - 8
-            amount = Decimal(m.group(1)) * pow(  Decimal(10) , k)
-        else:
-            amount = Decimal(am) * COIN
-        out['amount'] = int(amount)
+        try:
+            m = re.match(r'([0-9.]+)X([0-9])', am)
+            if m:
+                k = int(m.group(2)) - 8
+                amount = Decimal(m.group(1)) * pow(  Decimal(10) , k)
+            else:
+                amount = Decimal(am) * COIN
+            out['amount'] = int(amount)
+        except Exception as e:
+            raise InvalidBitcoinURI(f"failed to parse 'amount' field: {repr(e)}") from e
     if 'message' in out:
         out['message'] = out['message']
         out['memo'] = out['message']
     if 'time' in out:
-        out['time'] = int(out['time'])
+        try:
+            out['time'] = int(out['time'])
+        except Exception as e:
+            raise InvalidBitcoinURI(f"failed to parse 'time' field: {repr(e)}") from e
     if 'exp' in out:
-        out['exp'] = int(out['exp'])
+        try:
+            out['exp'] = int(out['exp'])
+        except Exception as e:
+            raise InvalidBitcoinURI(f"failed to parse 'exp' field: {repr(e)}") from e
     if 'sig' in out:
-        out['sig'] = bh2u(bitcoin.base_decode(out['sig'], None, base=58))
+        try:
+            out['sig'] = bh2u(bitcoin.base_decode(out['sig'], None, base=58))
+        except Exception as e:
+            raise InvalidBitcoinURI(f"failed to parse 'sig' field: {repr(e)}") from e
 
     r = out.get('r')
     sig = out.get('sig')
     name = out.get('name')
     if on_pr and (r or (name and sig)):
+        @log_exceptions
         async def get_payment_request():
             from . import paymentrequest as pr
             if name and sig:
@@ -782,7 +860,7 @@ def parse_URI(uri: str, on_pr: Callable=None) -> dict:
                 request = await pr.get_payment_request(r)
             if on_pr:
                 on_pr(request)
-        loop = asyncio.get_event_loop()
+        loop = loop or asyncio.get_event_loop()
         asyncio.run_coroutine_threadsafe(get_payment_request(), loop)
 
     return out
@@ -924,7 +1002,9 @@ def ignore_exceptions(func):
     async def wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
-        except BaseException as e:
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
             pass
     return wrapper
 
@@ -1003,6 +1083,10 @@ class NetworkJobOnDefaultServer(Logger):
         raise NotImplementedError()  # implemented by subclasses
 
     async def stop(self):
+        self.network.unregister_callback(self._restart)
+        await self._stop()
+
+    async def _stop(self):
         await self.group.cancel_remaining()
 
     @log_exceptions
@@ -1012,7 +1096,7 @@ class NetworkJobOnDefaultServer(Logger):
             return  # we should get called again soon
 
         async with self._restart_lock:
-            await self.stop()
+            await self._stop()
             self._reset()
             await self._start(interface)
 
@@ -1117,3 +1201,34 @@ def multisig_type(wallet_type):
     if match:
         match = [int(x) for x in match.group(1, 2)]
     return match
+
+
+def is_ip_address(x: Union[str, bytes]) -> bool:
+    if isinstance(x, bytes):
+        x = x.decode("utf-8")
+    try:
+        ipaddress.ip_address(x)
+        return True
+    except ValueError:
+        return False
+
+
+def list_enabled_bits(x: int) -> Sequence[int]:
+    """e.g. 77 (0b1001101) --> (0, 2, 3, 6)"""
+    binary = bin(x)[2:]
+    rev_bin = reversed(binary)
+    return tuple(i for i, b in enumerate(rev_bin) if b == '1')
+
+
+def resolve_dns_srv(host: str):
+    srv_records = dns.resolver.query(host, 'SRV')
+    # priority: prefer lower
+    # weight: tie breaker; prefer higher
+    srv_records = sorted(srv_records, key=lambda x: (x.priority, -x.weight))
+
+    def dict_from_srv_record(srv):
+        return {
+            'host': str(srv.target),
+            'port': srv.port,
+        }
+    return [dict_from_srv_record(srv) for srv in srv_records]

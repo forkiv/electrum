@@ -28,7 +28,7 @@ import json
 import copy
 import threading
 from collections import defaultdict
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple, Set, Iterable, NamedTuple
 
 from . import util, bitcoin
 from .util import profiler, WalletFileException, multisig_type, TxMinedInfo
@@ -40,7 +40,7 @@ from .logging import Logger
 
 OLD_SEED_VERSION = 4        # electrum versions < 2.0
 NEW_SEED_VERSION = 11       # electrum versions >= 2.0
-FINAL_SEED_VERSION = 18     # electrum >= 2.7 will set this to prevent
+FINAL_SEED_VERSION = 19     # electrum >= 2.7 will set this to prevent
                             # old versions from overwriting new format
 
 
@@ -51,6 +51,12 @@ class JsonDBJsonEncoder(util.MyEncoder):
         return super().default(obj)
 
 
+class TxFeesValue(NamedTuple):
+    fee: Optional[int] = None
+    is_calculated_by_us: bool = False
+    num_inputs: Optional[int] = None
+
+
 class JsonDB(Logger):
 
     def __init__(self, raw, *, manual_upgrades):
@@ -59,11 +65,12 @@ class JsonDB(Logger):
         self.data = {}
         self._modified = False
         self.manual_upgrades = manual_upgrades
-        if raw:
+        self._called_after_upgrade_tasks = False
+        if raw:  # loading existing db
             self.load_data(raw)
-        else:
+        else:  # creating new db
             self.put('seed_version', FINAL_SEED_VERSION)
-        self.load_transactions()
+            self._after_upgrade_tasks()
 
     def set_modified(self, b):
         with self.lock:
@@ -107,12 +114,6 @@ class JsonDB(Logger):
                 self.data[key] = copy.deepcopy(value)
                 return True
         elif key in self.data:
-            # clear current contents in case of references
-            cur_val = self.data[key]
-            clear_method = getattr(cur_val, "clear", None)
-            if callable(clear_method):
-                clear_method()
-            # pop from dict to delete key
             self.data.pop(key)
             return True
         return False
@@ -145,11 +146,13 @@ class JsonDB(Logger):
         if not isinstance(self.data, dict):
             raise WalletFileException("Malformed wallet file (not dict)")
 
-        if not self.manual_upgrades:
-            if self.requires_split():
-                raise WalletFileException("This wallet has multiple accounts and must be split")
-            if self.requires_upgrade():
-                self.upgrade()
+        if not self.manual_upgrades and self.requires_split():
+            raise WalletFileException("This wallet has multiple accounts and must be split")
+
+        if not self.requires_upgrade():
+            self._after_upgrade_tasks()
+        elif not self.manual_upgrades:
+            self.upgrade()
 
     def requires_split(self):
         d = self.get('accounts', {})
@@ -201,6 +204,9 @@ class JsonDB(Logger):
     @profiler
     def upgrade(self):
         self.logger.info('upgrading wallet format')
+        if self._called_after_upgrade_tasks:
+            # we need strict ordering between upgrade() and after_upgrade_tasks()
+            raise Exception("'after_upgrade_tasks' must NOT be called before 'upgrade'")
         self._convert_imported()
         self._convert_wallet_type()
         self._convert_account()
@@ -210,7 +216,14 @@ class JsonDB(Logger):
         self._convert_version_16()
         self._convert_version_17()
         self._convert_version_18()
+        self._convert_version_19()
         self.put('seed_version', FINAL_SEED_VERSION)  # just to be sure
+
+        self._after_upgrade_tasks()
+
+    def _after_upgrade_tasks(self):
+        self._called_after_upgrade_tasks = True
+        self._load_transactions()
 
     def _convert_wallet_type(self):
         if not self._is_upgrade_method_needed(0, 13):
@@ -407,15 +420,16 @@ class JsonDB(Logger):
 
         self.put('pruned_txo', None)
 
-        transactions = self.get('transactions', {})  # txid -> Transaction
+        transactions = self.get('transactions', {})  # txid -> raw_tx
         spent_outpoints = defaultdict(dict)
-        for txid, tx in transactions.items():
+        for txid, raw_tx in transactions.items():
+            tx = Transaction(raw_tx)
             for txin in tx.inputs():
                 if txin['type'] == 'coinbase':
                     continue
                 prevout_hash = txin['prevout_hash']
                 prevout_n = txin['prevout_n']
-                spent_outpoints[prevout_hash][prevout_n] = txid
+                spent_outpoints[prevout_hash][str(prevout_n)] = txid
         self.put('spent_outpoints', spent_outpoints)
 
         self.put('seed_version', 17)
@@ -427,7 +441,14 @@ class JsonDB(Logger):
         self.put('verified_tx3', None)
         self.put('seed_version', 18)
 
-    # def _convert_version_19(self):
+    def _convert_version_19(self):
+        # delete tx_fees as its structure changed
+        if not self._is_upgrade_method_needed(18, 18):
+            return
+        self.put('tx_fees', None)
+        self.put('seed_version', 19)
+
+    # def _convert_version_20(self):
     #     TODO for "next" upgrade:
     #       - move "pw_hash_version" from keystore to storage
     #     pass
@@ -467,6 +488,7 @@ class JsonDB(Logger):
         self.put('accounts', None)
 
     def _is_upgrade_method_needed(self, min_version, max_version):
+        assert min_version <= max_version
         cur_version = self.get_seed_version()
         if cur_version > max_version:
             return False
@@ -495,7 +517,7 @@ class JsonDB(Logger):
         return seed_version
 
     def _raise_unsupported_version(self, seed_version):
-        msg = "Your wallet has an unsupported seed version."
+        msg = f"Your wallet has an unsupported seed version: {seed_version}."
         if seed_version in [5, 7, 8, 9, 10, 14]:
             msg += "\n\nTo open this wallet, try 'git checkout seed_v%d'"%seed_version
         if seed_version == 6:
@@ -510,20 +532,24 @@ class JsonDB(Logger):
         raise WalletFileException(msg)
 
     @locked
-    def get_txi(self, tx_hash):
+    def get_txi_addresses(self, tx_hash) -> List[str]:
+        """Returns list of is_mine addresses that appear as inputs in tx."""
         return list(self.txi.get(tx_hash, {}).keys())
 
     @locked
-    def get_txo(self, tx_hash):
+    def get_txo_addresses(self, tx_hash) -> List[str]:
+        """Returns list of is_mine addresses that appear as outputs in tx."""
         return list(self.txo.get(tx_hash, {}).keys())
 
     @locked
-    def get_txi_addr(self, tx_hash, address):
-        return self.txi.get(tx_hash, {}).get(address, [])
+    def get_txi_addr(self, tx_hash, address) -> Iterable[Tuple[str, int]]:
+        """Returns an iterable of (prev_outpoint, value)."""
+        return self.txi.get(tx_hash, {}).get(address, []).copy()
 
     @locked
-    def get_txo_addr(self, tx_hash, address):
-        return self.txo.get(tx_hash, {}).get(address, [])
+    def get_txo_addr(self, tx_hash, address) -> Iterable[Tuple[int, int, bool]]:
+        """Returns an iterable of (output_index, value, is_coinbase)."""
+        return self.txo.get(tx_hash, {}).get(address, []).copy()
 
     @modifier
     def add_txi_addr(self, tx_hash, addr, ser, v):
@@ -574,19 +600,22 @@ class JsonDB(Logger):
 
     @locked
     def get_spent_outpoint(self, prevout_hash, prevout_n):
-        return self.spent_outpoints.get(prevout_hash, {}).get(str(prevout_n))
+        prevout_n = str(prevout_n)
+        return self.spent_outpoints.get(prevout_hash, {}).get(prevout_n)
 
     @modifier
     def remove_spent_outpoint(self, prevout_hash, prevout_n):
-        self.spent_outpoints[prevout_hash].pop(prevout_n, None)  # FIXME
+        prevout_n = str(prevout_n)
+        self.spent_outpoints[prevout_hash].pop(prevout_n, None)
         if not self.spent_outpoints[prevout_hash]:
             self.spent_outpoints.pop(prevout_hash)
 
     @modifier
     def set_spent_outpoint(self, prevout_hash, prevout_n, tx_hash):
+        prevout_n = str(prevout_n)
         if prevout_hash not in self.spent_outpoints:
             self.spent_outpoints[prevout_hash] = {}
-        self.spent_outpoints[prevout_hash][str(prevout_n)] = tx_hash
+        self.spent_outpoints[prevout_hash][prevout_n] = tx_hash
 
     @modifier
     def add_transaction(self, tx_hash: str, tx: Transaction) -> None:
@@ -652,12 +681,50 @@ class JsonDB(Logger):
         return txid in self.verified_tx
 
     @modifier
-    def update_tx_fees(self, d):
-        return self.tx_fees.update(d)
+    def add_tx_fee_from_server(self, txid: str, fee_sat: Optional[int]) -> None:
+        # note: when called with (fee_sat is None), rm currently saved value
+        if txid not in self.tx_fees:
+            self.tx_fees[txid] = TxFeesValue()
+        tx_fees_value = self.tx_fees[txid]
+        if tx_fees_value.is_calculated_by_us:
+            return
+        self.tx_fees[txid] = tx_fees_value._replace(fee=fee_sat, is_calculated_by_us=False)
+
+    @modifier
+    def add_tx_fee_we_calculated(self, txid: str, fee_sat: Optional[int]) -> None:
+        if fee_sat is None:
+            return
+        if txid not in self.tx_fees:
+            self.tx_fees[txid] = TxFeesValue()
+        self.tx_fees[txid] = self.tx_fees[txid]._replace(fee=fee_sat, is_calculated_by_us=True)
 
     @locked
-    def get_tx_fee(self, txid):
-        return self.tx_fees.get(txid)
+    def get_tx_fee(self, txid: str, *, trust_server=False) -> Optional[int]:
+        """Returns tx_fee."""
+        tx_fees_value = self.tx_fees.get(txid)
+        if tx_fees_value is None:
+            return None
+        if not trust_server and not tx_fees_value.is_calculated_by_us:
+            return None
+        return tx_fees_value.fee
+
+    @modifier
+    def add_num_inputs_to_tx(self, txid: str, num_inputs: int) -> None:
+        if txid not in self.tx_fees:
+            self.tx_fees[txid] = TxFeesValue()
+        self.tx_fees[txid] = self.tx_fees[txid]._replace(num_inputs=num_inputs)
+
+    @locked
+    def get_num_all_inputs_of_tx(self, txid: str) -> Optional[int]:
+        tx_fees_value = self.tx_fees.get(txid)
+        if tx_fees_value is None:
+            return None
+        return tx_fees_value.num_inputs
+
+    @locked
+    def get_num_ismine_inputs_of_tx(self, txid: str) -> int:
+        txins = self.txi.get(txid, {})
+        return sum([len(tupls) for addr, tupls in txins.items()])
 
     @modifier
     def remove_tx_fee(self, txid):
@@ -665,6 +732,8 @@ class JsonDB(Logger):
 
     @locked
     def get_data_ref(self, name):
+        # Warning: interacts un-intuitively with 'put': certain parts
+        # of 'data' will have pointers saved as separate variables.
         if name not in self.data:
             self.data[name] = {}
         return self.data[name]
@@ -678,12 +747,14 @@ class JsonDB(Logger):
         return len(self.receiving_addresses)
 
     @locked
-    def get_change_addresses(self):
-        return list(self.change_addresses)
+    def get_change_addresses(self, *, slice_start=None, slice_stop=None):
+        # note: slicing makes a shallow copy
+        return self.change_addresses[slice_start:slice_stop]
 
     @locked
-    def get_receiving_addresses(self):
-        return list(self.receiving_addresses)
+    def get_receiving_addresses(self, *, slice_start=None, slice_stop=None):
+        # note: slicing makes a shallow copy
+        return self.receiving_addresses[slice_start:slice_stop]
 
     @modifier
     def add_change_address(self, addr):
@@ -737,15 +808,18 @@ class JsonDB(Logger):
                 self._addr_to_addr_index[addr] = (True, i)
 
     @profiler
-    def load_transactions(self):
+    def _load_transactions(self):
         # references in self.data
-        self.txi = self.get_data_ref('txi')  # txid -> address -> list of (prev_outpoint, value)
-        self.txo = self.get_data_ref('txo')  # txid -> address -> list of (output_index, value, is_coinbase)
+        # TODO make all these private
+        # txid -> address -> set of (prev_outpoint, value)
+        self.txi = self.get_data_ref('txi')  # type: Dict[str, Dict[str, Set[Tuple[str, int]]]]
+        # txid -> address -> set of (output_index, value, is_coinbase)
+        self.txo = self.get_data_ref('txo')  # type: Dict[str, Dict[str, Set[Tuple[int, int, bool]]]]
         self.transactions = self.get_data_ref('transactions')   # type: Dict[str, Transaction]
-        self.spent_outpoints = self.get_data_ref('spent_outpoints')
+        self.spent_outpoints = self.get_data_ref('spent_outpoints')  # txid -> output_index -> next_txid
         self.history = self.get_data_ref('addr_history')  # address -> list of (txid, height)
         self.verified_tx = self.get_data_ref('verified_tx3')  # txid -> (height, timestamp, txpos, header_hash)
-        self.tx_fees = self.get_data_ref('tx_fees')
+        self.tx_fees = self.get_data_ref('tx_fees')  # type: Dict[str, TxFeesValue]
         # convert raw hex transactions to Transaction objects
         for tx_hash, raw_tx in self.transactions.items():
             self.transactions[tx_hash] = Transaction(raw_tx)
@@ -756,7 +830,7 @@ class JsonDB(Logger):
                     d[addr] = set([tuple(x) for x in lst])
         # remove unreferenced tx
         for tx_hash in list(self.transactions.keys()):
-            if not self.get_txi(tx_hash) and not self.get_txo(tx_hash):
+            if not self.get_txi_addresses(tx_hash) and not self.get_txo_addresses(tx_hash):
                 self.logger.info(f"removing unreferenced tx: {tx_hash}")
                 self.transactions.pop(tx_hash)
         # remove unreferenced outpoints
@@ -766,6 +840,9 @@ class JsonDB(Logger):
                 if spending_txid not in self.transactions:
                     self.logger.info("removing unreferenced spent outpoint")
                     d.pop(prevout_n)
+        # convert tx_fees tuples to NamedTuples
+        for tx_hash, tuple_ in self.tx_fees.items():
+            self.tx_fees[tx_hash] = TxFeesValue(*tuple_)
 
     @modifier
     def clear_history(self):

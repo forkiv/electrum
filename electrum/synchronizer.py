@@ -26,14 +26,16 @@ import asyncio
 import hashlib
 from typing import Dict, List, TYPE_CHECKING, Tuple
 from collections import defaultdict
+import logging
 
-from aiorpcx import TaskGroup, run_in_thread
+from aiorpcx import TaskGroup, run_in_thread, RPCError
 
 from .transaction import Transaction
 from .util import bh2u, make_aiohttp_session, NetworkJobOnDefaultServer
 from .bitcoin import address_to_scripthash, is_address
 from .network import UntrustedServerReturnedError
 from .logging import Logger
+from .interface import GracefulDisconnect
 
 if TYPE_CHECKING:
     from .network import Network
@@ -103,7 +105,12 @@ class SynchronizerBase(NetworkJobOnDefaultServer):
             h = address_to_scripthash(addr)
             self.scripthash_to_address[h] = addr
             self._requests_sent += 1
-            await self.session.subscribe('blockchain.scripthash.subscribe', [h], self.status_queue)
+            try:
+                await self.session.subscribe('blockchain.scripthash.subscribe', [h], self.status_queue)
+            except RPCError as e:
+                if e.message == 'history too large':  # no unique error code
+                    raise GracefulDisconnect(e, log_level=logging.ERROR) from e
+                raise
             self._requests_answered += 1
             self.requested_addrs.remove(addr)
 
@@ -140,7 +147,7 @@ class Synchronizer(SynchronizerBase):
     def _reset(self):
         super()._reset()
         self.requested_tx = {}
-        self.requested_histories = {}
+        self.requested_histories = set()
 
     def diagnostic_name(self):
         return self.wallet.diagnostic_name()
@@ -154,10 +161,10 @@ class Synchronizer(SynchronizerBase):
         history = self.wallet.db.get_addr_history(addr)
         if history_status(history) == status:
             return
-        if addr in self.requested_histories:
+        if (addr, status) in self.requested_histories:
             return
         # request address history
-        self.requested_histories[addr] = status
+        self.requested_histories.add((addr, status))
         h = address_to_scripthash(addr)
         self._requests_sent += 1
         result = await self.network.get_history_for_scripthash(h)
@@ -181,7 +188,7 @@ class Synchronizer(SynchronizerBase):
             await self._request_missing_txs(hist)
 
         # Remove request; this allows up_to_date to be True
-        self.requested_histories.pop(addr)
+        self.requested_histories.discard((addr, status))
 
     async def _request_missing_txs(self, hist, *, allow_server_not_finding_tx=False):
         # "hist" is a list of [tx_hash, tx_height] lists
@@ -285,6 +292,6 @@ class Notifier(SynchronizerBase):
                     async with session.post(url, json=data, headers=headers) as resp:
                         await resp.text()
             except Exception as e:
-                self.logger.info(str(e))
+                self.logger.info(repr(e))
             else:
                 self.logger.info(f'Got Response for {addr}')

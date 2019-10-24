@@ -4,7 +4,7 @@ from electrum.bitcoin import TYPE_ADDRESS
 from electrum.keystore import xpubkey_to_address
 from electrum.util import bh2u, bfh
 
-from . import SequentialTestCase, TestCaseForTestnet
+from . import ElectrumTestCase, TestCaseForTestnet
 from .test_bitcoin import needs_test_with_all_ecc_implementations
 
 unsigned_blob = '45505446ff0001000000012a5c9a94fcde98f5581cd00162c60a13936ceb75389ea65bf38633b424eb4031000000005701ff4c53ff0488b21e03ef2afea18000000089689bff23e1e7fb2f161daa37270a97a3d8c2e537584b2d304ecb47b86d21fc021b010d3bd425f8cf2e04824bfdf1f1f5ff1d51fadd9a41f9e3fb8dd3403b1bfe00000000ffffffff0140420f00000000001976a914230ac37834073a42146f11ef8414ae929feaafc388ac00000000'
@@ -14,7 +14,7 @@ signed_segwit_blob = "01000000000101b66d722484f2db63e827ebf41d02684fed0c6550e850
 
 signed_blob_signatures = ['3046022100a82bbc57a0136751e5433f41cf000b3f1a99c6744775e76ec764fb78c54ee100022100f9e80b7de89de861dc6fb0c1429d5da72c2b6b2ee2406bc9bfb1beedd729d98501', ]
 
-class TestBCDataStream(SequentialTestCase):
+class TestBCDataStream(ElectrumTestCase):
 
     def test_compact_size(self):
         s = transaction.BCDataStream()
@@ -55,7 +55,7 @@ class TestBCDataStream(SequentialTestCase):
         self.assertEqual(s.read_bytes(4), b'r')
         self.assertEqual(s.read_bytes(1), b'')
 
-class TestTransaction(SequentialTestCase):
+class TestTransaction(ElectrumTestCase):
 
     @needs_test_with_all_ecc_implementations
     def test_tx_unsigned(self):
@@ -836,6 +836,11 @@ class TestTransactionTestnet(TestCaseForTestnet):
     def test_txid_partial_segwit_p2wpkh_p2sh_mixed_outputs(self):
         raw_tx = '45505446ff00010000000001011dcac788f24b84d771b60c44e1f9b6b83429e50f06e1472d47241922164013b00100000017160014801d28ca6e2bde551112031b6cb75de34f10851ffdffffff0440420f00000000001600140f9de573bc679d040e763d13f0250bd03e625f6fc0c62d000000000017a9142899f6484e477233ce60072fc185ef4c1f2c654487809698000000000017a914d40f85ba3c8fa0f3615bcfa5d6603e36dfc613ef87712d19040000000017a914e38c0cffde769cb65e72cda1c234052ae8d2254187feffffffff6ad1ee040000000000000201ff53ff044a5262033601222e800000001618aa51e49a961f63fd111f64cd4a7e792c1d7168be7a07703de505ebed2cf70286ebbe755767adaa5835f4d78dec1ee30849d69eacfe80b7ee6b1585279536c301000c000f391400'
         txid = 'ba5c88e07a4025a39ad3b85247cbd4f556a70d6312b18e04513c7cec9d45d6ac'
+        self._run_naive_tests_on_tx(raw_tx, txid)
+
+    def test_txid_partial_issue_5366(self):
+        raw_tx = '45505446ff000200000000010127523d70642dabd999fb43191ff6763f5b04150ba4cf38d2cfb53edf6a40ac4f0100000000fdffffff013286010000000000160014e79c7ac0b390a9caf52dc002e1095a5fbc042a18feffffffffa08601000000000000000201ff57ff045f1cf60157e9eb7a8000000038fa0b3a9c155ff3390ca0d639783d97af3b3bf66ebb69a31dfe8317fae0a7fe0324bc048fc0002253dfec9d6299711d708175f950ecee8e09db3518a5685741830000ffffcf01010043281700'
+        txid = 'a0c159616073dc7a4a482092dab4e8516c83dddb769b65919f23f6df63d33eb8'
         self._run_naive_tests_on_tx(raw_tx, txid)
 
 # end partial txns <---

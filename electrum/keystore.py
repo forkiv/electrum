@@ -26,7 +26,7 @@
 
 from unicodedata import normalize
 import hashlib
-from typing import Tuple
+from typing import Tuple, TYPE_CHECKING, Union, Sequence
 
 from . import bitcoin, ecc, constants, bip32
 from .bitcoin import (deserialize_privkey, serialize_privkey,
@@ -41,6 +41,9 @@ from .util import (InvalidPassword, WalletFileException,
 from .mnemonic import Mnemonic, load_wordlist, seed_type, is_seed
 from .plugin import run_hook
 from .logging import Logger
+
+if TYPE_CHECKING:
+    from .transaction import Transaction
 
 
 class KeyStore(Logger):
@@ -92,6 +95,21 @@ class KeyStore(Logger):
 
     def ready_to_sign(self):
         return not self.is_watching_only()
+
+    def dump(self) -> dict:
+        raise NotImplementedError()  # implemented by subclasses
+
+    def is_deterministic(self) -> bool:
+        raise NotImplementedError()  # implemented by subclasses
+
+    def sign_message(self, sequence, message, password) -> bytes:
+        raise NotImplementedError()  # implemented by subclasses
+
+    def decrypt_message(self, sequence, message, password) -> bytes:
+        raise NotImplementedError()  # implemented by subclasses
+
+    def sign_transaction(self, tx: 'Transaction', password) -> None:
+        raise NotImplementedError()  # implemented by subclasses
 
 
 class Software_KeyStore(KeyStore):
@@ -246,6 +264,8 @@ class Deterministic_KeyStore(Software_KeyStore):
         self.seed = self.format_seed(seed)
 
     def get_seed(self, password):
+        if not self.has_seed():
+            raise Exception("This wallet has no seed words")
         return pw_decode(self.seed, password, version=self.pw_hash_version)
 
     def get_passphrase(self, password):
@@ -282,7 +302,13 @@ class Xpub:
         return node.eckey.get_public_key_hex(compressed=True)
 
     def get_xpubkey(self, c, i):
-        s = ''.join(map(lambda x: bitcoin.int_to_hex(x,2), (c, i)))
+        def encode_path_int(path_int) -> str:
+            if path_int < 0xffff:
+                hex = bitcoin.int_to_hex(path_int, 2)
+            else:
+                hex = 'ffff' + bitcoin.int_to_hex(path_int, 4)
+            return hex
+        s = ''.join(map(encode_path_int, (c, i)))
         return 'ff' + bh2u(bitcoin.DecodeBase58Check(self.xpub)) + s
 
     @classmethod
@@ -296,11 +322,14 @@ class Xpub:
         # derivation:
         dd = pk[78:]
         s = []
-        # FIXME: due to an oversight, levels in the derivation are only
-        # allocated 2 bytes, instead of 4 (in bip32)
         while dd:
-            n = int(bitcoin.rev_hex(bh2u(dd[0:2])), 16)
+            # 2 bytes for derivation path index
+            n = int.from_bytes(dd[0:2], byteorder="little")
             dd = dd[2:]
+            # in case of overflow, drop these 2 bytes; and use next 4 bytes instead
+            if n == 0xffff:
+                n = int.from_bytes(dd[0:4], byteorder="little")
+                dd = dd[4:]
             s.append(n)
         assert len(s) == 2
         return xkey, s
@@ -374,7 +403,10 @@ class BIP32_KeyStore(Deterministic_KeyStore, Xpub):
         pk = node.eckey.get_secret_bytes()
         return pk, True
 
-
+    def get_keypair(self, sequence, password):
+        k, _ = self.get_private_key(sequence, password)
+        cK = ecc.ECPrivkey(k).get_public_key_bytes()
+        return cK, k
 
 class Old_KeyStore(Deterministic_KeyStore):
 
@@ -711,7 +743,7 @@ hw_keystores = {}
 def register_keystore(hw_type, constructor):
     hw_keystores[hw_type] = constructor
 
-def hardware_keystore(d):
+def hardware_keystore(d) -> Hardware_KeyStore:
     hw_type = d['hw_type']
     if hw_type in hw_keystores:
         constructor = hw_keystores[hw_type]
@@ -719,7 +751,7 @@ def hardware_keystore(d):
     raise WalletFileException(f'unknown hardware type: {hw_type}. '
                               f'hw_keystores: {list(hw_keystores)}')
 
-def load_keystore(storage, name):
+def load_keystore(storage, name) -> KeyStore:
     d = storage.get(name, {})
     t = d.get('type')
     if not t:
